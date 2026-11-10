@@ -97,9 +97,13 @@ checked separately: unit tests, byte parity on fresh clips of all 14 streams (14
 (vs 227 for the first version, same moment), and 13 minutes beside the production hub on the same live streams.
 It then replaced the first version in production and ran for 3 hours (checked at the end): all 14 cameras at
 3.0-3.1 fps with 0 skipped, detector 11-13 ms, 0 wedged-decoder reconnects, no restarts, RSS 285 MB at 4 minutes
-and 312 MB at 3 hours. In that window the restream itself went down for a few minutes (the RTSP port refused
-connections, and recordings, which do not go through the hub, had gaps on 7 cameras); the hub reconnected every
-camera on its own and needed no restart.
+and 312 MB at 3 hours. It needed no restart, but it was not flawless: one camera's detection stalled for about
+5 minutes. Frigate's watchdog restarted that camera's reader three times ("No frames received … in 20 seconds"); the
+hub's session for it stayed open and sent no frame, yet neither the read timeout nor the starve check fired, which
+fits a stream that trickled (not confirmed from the logs); only a stream error ended the session, and the reconnect
+brought the camera back. In the same minutes the restream refused the hub's RTSP connections once, and recordings
+(which do not go through the hub) had gaps on 7 cameras; the same cameras show the same kind of recording gaps on
+earlier days, before the hub existed.
 
 **VRAM**
 
@@ -309,6 +313,9 @@ hand: copy `config.yml.pre-nvdec-shared-<UTC>` over your config and restart Frig
 
 - **Tested on one setup**: the system above, 14 cameras, one GPU model, one driver, one Frigate version.
 - **The current version has had a few hours in production** (see "Versions"), not weeks.
+- **A trickling stream can stall one camera's detection.** Packets that keep arriving, but too few for the starve
+  check, kept one camera's session open with no frames for about 5 minutes until a stream error reconnected it
+  (see "Versions"). A fix is being tested.
 - **A shared, busy GPU can still interrupt detection.** On the test system, after a GPU fault caused by another
   workload (`Xid 109`, context-switch timeout), the hub's camera connections timed out more often, one or two
   15-second detect pauses a minute somewhere across 14 cameras, for over an hour. The restream itself kept delivering
