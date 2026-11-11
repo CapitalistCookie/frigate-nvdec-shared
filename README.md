@@ -80,6 +80,14 @@ Failure handling:
   18 packets, while every call returned without an error. `tools/stalltest.py` forces that wedge on saved clips:
   the wedge started 30 s in, the camera reconnected 30 s later (`decoder starved: 22 frames from 401 packets`) and
   decoded normally 2 s after that; the control camera and a run without the forced wedge never reconnected;
+- a camera that has had no frame picked for 30 s while packets still arrive reconnects too. This closes a gap the
+  check above leaves: a stream that trickles (a few packets now and then, never 15 s apart, so the read timeout does
+  not fire, and under 20 packets per window, so the starve check stays out of it). In service one camera did exactly
+  that, as far as the logs show, and its detection stopped for about 5 minutes (see "Versions"). `tools/stalltest.py --trickle` reproduces it on
+  saved recordings: the previous version never reconnected (`sessions stalled=1 … RESULT=FAIL`), this one
+  reconnected 32 s after the trickle began (`no frame picked for 32 s while packets still arrive`) and decoded
+  normally 2 s later (`RESULT=PASS`); the starve case and a clean run still pass. 30 s is longer than Frigate's own
+  20 s detect watchdog, so Frigate restarts its reader first and the two do not race;
 - if one camera thread is stuck in a single call for 120 s, or no camera has produced a frame for 90 s, the hub
   exits (code 3 or 4) and Docker restarts it clean;
 - Frigate notices a broken socket like any dead stream and restarts its reader ffmpeg by itself.
@@ -99,11 +107,21 @@ It then replaced the first version in production and ran for 3 hours (checked at
 3.0-3.1 fps with 0 skipped, detector 11-13 ms, 0 wedged-decoder reconnects, no restarts, RSS 285 MB at 4 minutes
 and 312 MB at 3 hours. It needed no restart, but it was not flawless: one camera's detection stalled for about
 5 minutes. Frigate's watchdog restarted that camera's reader three times ("No frames received … in 20 seconds"); the
-hub's session for it stayed open and sent no frame, yet neither the read timeout nor the starve check fired, which
-fits a stream that trickled (not confirmed from the logs); only a stream error ended the session, and the reconnect
-brought the camera back. In the same minutes the restream refused the hub's RTSP connections once, and recordings
-(which do not go through the hub) had gaps on 7 cameras; the same cameras show the same kind of recording gaps on
-earlier days, before the hub existed.
+hub's session for it stayed open, logging decoder errors ("No decoder surfaces left"), and sent no frame, yet neither
+the read timeout nor the starve check fired, which fits a stream that trickled (not confirmed from the logs); only a
+stream error ended the session, and the reconnect brought the camera back. The current `hub.py` adds the 30 s no-frame reconnect for exactly this (see "Failure handling");
+that change passed the offline tests above and then went into production; checked after 2 hours there: no restarts,
+no error or warning lines, all 14 cameras at 3.0-3.1 fps with 0 skipped, detector 12 ms, RSS 284 MB at 3 minutes and
+286 MB at 2 hours. No stream trickled in that time, so the new check never fired: its behaviour on a real trickle is
+still shown only by the offline test. In the same minutes as the 5-minute stall the restream refused the hub's RTSP
+connections once, and recordings (which do not go through the hub) had gaps on 7 cameras; the same cameras show the
+same kind of recording gaps on earlier days, before the hub existed.
+
+Not caused by the hub, but worth knowing if your recordings share a busy hard disk: twice on this system (once before
+the hub existed) heavy IO on the single HDD that holds Frigate's clips stalled reads for over 300 s (ZFS deadman
+events), and all cameras lost minutes of recordings. Frigate 0.17 writes snapshots on the same thread that hands
+detection results to the recorder, so when that disk stalls the recorder drops segments and blames "the detect
+stream", even though decoding and detection are fine.
 
 **VRAM**
 
@@ -161,6 +179,7 @@ Re-run with the code in this repository (`tools/parity.py`, Frigate's own parser
 | detect fps 5, Frigate's default chain | 11 | 3 | 0 |
 | current version, fresh clips of all 14 streams, detect fps 3, Frigate's default chain | 14 | 0 | 0 |
 | current version, the saved clips of the rows above, detect fps 3, Frigate's default chain | 14 | 0 | 0 |
+| current version, one 10 s recording per camera (11 × H.265 2560×1440, 3 × H.264 1920×1080), detect = clip size | 14 | 0 | 0 |
 
 The first three rows used the first version's download path (the frame selection code is the same in both). On
 the saved clips the current version's A hashes equal those of the first rows, and the one clip whose first-version
@@ -312,17 +331,16 @@ hand: copy `config.yml.pre-nvdec-shared-<UTC>` over your config and restart Frig
 ## Limitations
 
 - **Tested on one setup**: the system above, 14 cameras, one GPU model, one driver, one Frigate version.
-- **The current version has had a few hours in production** (see "Versions"), not weeks.
-- **A trickling stream can stall one camera's detection.** Packets that keep arriving, but too few for the starve
-  check, kept one camera's session open with no frames for about 5 minutes until a stream error reconnected it
-  (see "Versions"). A fix is being tested.
+- **The current version has had a few hours in production** (see "Versions"), not weeks; its 30 s no-frame
+  reconnect has not yet fired in production (it has been exercised offline only).
 - **A shared, busy GPU can still interrupt detection.** On the test system, after a GPU fault caused by another
   workload (`Xid 109`, context-switch timeout), the hub's camera connections timed out more often, one or two
   15-second detect pauses a minute somewhere across 14 cameras, for over an hour. The restream itself kept delivering
   (a demux-only reader saw no gap over 0.2 s). Part of this was the GIL freeze the current version removes; one
   burst that hit the old and the new hub at the same moment is not explained. The stock per-camera ffmpegs had no
   exits over two 5–7 minute windows in the same period.
-- **H.264 only tested.** The hub would decode H.265 on NVDEC too, but no H.265 stream was tested.
+- **H.264 only tested live.** H.265 decoding on NVDEC passed the byte-parity check offline (11 recordings at
+  2560×1440, see the parity table), but no H.265 detect stream has run through the hub in service.
 - **Detect streams only.** Recordings, live view, birdseye and any NVENC transcodes are untouched (and keep their
   own CUDA processes, if they had any).
 - **One shared failure domain.** Every converted camera's detection depends on one process and one CUDA context. A

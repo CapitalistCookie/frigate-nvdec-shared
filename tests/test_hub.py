@@ -173,3 +173,31 @@ def test_cuda_download_refuses_a_frame_that_is_not_on_the_gpu_or_the_wrong_size(
         dl.nv12(types.SimpleNamespace(format=types.SimpleNamespace(name="nv12"), width=8, height=4), 8, 4)
     with pytest.raises(RuntimeError, match="unexpected frame"):
         dl.nv12(types.SimpleNamespace(format=types.SimpleNamespace(name="cuda"), width=8, height=6), 8, 4)
+
+
+def test_noframe_check_reconnects_a_trickling_stream_that_the_starve_check_lets_through():
+    # 1 packet every 2 s (10 per 20 s window: below STARVE_MIN_PACKETS) and no frame picked
+    starve, noframe = hub.StarveCheck(0.0), hub.NoFrameCheck(0.0)
+    t, tripped = 0.0, None
+    while t < 120 and tripped is None:
+        starve.packet(t)  # never raises: too few packets per window
+        try:
+            noframe.packet(t)
+        except RuntimeError as e:
+            tripped = (t, str(e))
+        t += 2.0
+    assert tripped is not None and hub.NOFRAME_S < tripped[0] <= hub.NOFRAME_S + 2
+    assert "no frame picked" in tripped[1]
+
+
+def test_noframe_check_is_quiet_while_frames_are_picked():
+    noframe = hub.NoFrameCheck(0.0)
+    for i in range(20 * 300):  # 5 min at 20 packets/s, a pick every 7 packets (3 fps)
+        noframe.packet(i / 20)
+        if i % 7 == 0:
+            noframe.picked(i / 20)
+
+
+def test_session_wires_the_noframe_check():
+    src = open(hub.__file__).read()
+    assert "noframe.packet(self.beat)" in src and "noframe.picked(self.beat)" in src

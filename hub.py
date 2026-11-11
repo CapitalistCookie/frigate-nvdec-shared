@@ -53,6 +53,11 @@ STARVE_WINDOW_S = 20  # the same 20 s Frigate's own watchdog gives a detect ffmp
 STARVE_FIRST_S = 40  # the first window is longer: a session that joins mid-GOP waits for a keyframe
 STARVE_RATIO = 8
 STARVE_MIN_PACKETS = 20  # a window with fewer packets says nothing (the stream itself is slow or stalled)
+# ...which is how a trickling stream slipped through: in service one camera sent a few packets now and then, never
+# 15 s apart (so the read timeout never fired) and never enough for a window, while no frame went out for 5 minutes.
+# So also: a session that has sent no frame for this long reconnects (Frigate's own watchdog gives a detect ffmpeg 20 s;
+# this is longer, so a reconnect here never races Frigate's restart of its reader).
+NOFRAME_S = 30
 NAME_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 USER_PASS_RE = re.compile(r":\/\/[a-zA-Z0-9_-]+:[\S]+@")  # Frigate's REGEX_RTSP_CAMERA_USER_PASS
 
@@ -193,6 +198,20 @@ class FpsPicker:
         return out, times
 
 
+class NoFrameCheck:
+    """Raises at the first packet that arrives more than NOFRAME_S after the session's last picked frame (or its start)."""
+
+    def __init__(self, now):
+        self.last = now
+
+    def picked(self, now):
+        self.last = now
+
+    def packet(self, now):
+        if now - self.last > NOFRAME_S:
+            raise RuntimeError(f"no frame picked for {now - self.last:.0f} s while packets still arrive, reconnecting it")
+
+
 class StarveCheck:
     """Counts packets in and frames out per window; raises at the first packet after a starved window."""
 
@@ -271,12 +290,13 @@ class Camera(threading.Thread):
             st = c.streams.video[0]
             st.codec_context.thread_count = 1
             picker, off, bad = None, ts_offset(c, st), 0
-            starve = StarveCheck(time.monotonic())
+            starve, noframe = StarveCheck(time.monotonic()), NoFrameCheck(time.monotonic())
             for packet in c.demux(st):
                 self.beat = time.monotonic()
                 if STOP.is_set():
                     return got
                 starve.packet(self.beat)
+                noframe.packet(self.beat)
                 try:
                     frames = packet.decode()
                     bad = 0
@@ -300,6 +320,7 @@ class Camera(threading.Thread):
                     self.last_frame = self.beat
                     out, times = picker.push(frame, frame.pts - off)
                     if times:
+                        noframe.picked(self.beat)
                         data = nv12_bytes(out, self.width, self.height)
                         for _ in range(times):
                             self.emit(data)
